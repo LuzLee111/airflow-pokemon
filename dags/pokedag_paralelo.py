@@ -18,6 +18,16 @@ POKEMON_DATA_PATH = "/tmp/pokemon_data/pokemon_data.json"
 SPECIES_DATA_PATH = "/tmp/pokemon_data/species_data.json"
 MERGED_DATA_PATH = "/tmp/pokemon_data/pokemon_merged.csv"
 
+
+OUTPUT_FINAL_DIR = "/usr/local/airflow/output"
+os.makedirs(OUTPUT_FINAL_DIR, exist_ok=True)
+
+# Correo
+EMAIL_TO = "cienciadedatos.frm.utn@gmail.com"
+EMAIL_FROM = os.environ.get("SMTP_USER")  # puede ser la misma cuenta
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT_SSL = int(os.environ.get("SMTP_PORT_SSL", "465"))
+
 default_args = {
     'owner': 'pablo',
     'start_date': datetime.today() - timedelta(days=1),
