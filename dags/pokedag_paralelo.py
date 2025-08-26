@@ -26,7 +26,7 @@ SPECIES_DATA_PATH = "/tmp/pokemon_data/species_data.json"
 MERGED_DATA_PATH = "/tmp/pokemon_data/pokemon_merged.csv"
 
 default_args = {
-    'owner': 'pablo',
+    'owner': 'Maria',
     'start_date': datetime.today() - timedelta(days=1),
     'retries': 1,
     'retry_delay': timedelta(minutes=2),
