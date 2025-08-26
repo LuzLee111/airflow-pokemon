@@ -11,6 +11,7 @@ import logging
 from requests.exceptions import ConnectionError, HTTPError
 logging.getLogger("airflow.hooks.base").setLevel(logging.ERROR)
 
+GROUP_NAME = "Grupo 7"
 POKEMON_LIMIT = 1000
 OUTPUT_PATH = "/tmp/pokemon_data/pokemon_base.csv"
 POKEMON_DATA_PATH = "/tmp/pokemon_data/pokemon_data.json"
