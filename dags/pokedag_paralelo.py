@@ -1,312 +1,217 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.http.operators.http import HttpOperator
-from airflow.providers.http.hooks.http import HttpHook
-from datetime import datetime, timedelta
+# dags/recs_itunes_dag.py
+from __future__ import annotations
+import json, math, os, re, sqlite3, zipfile
+from pathlib import Path
+from typing import List, Dict
+
 import pandas as pd
-import os
-import json
-import time
-import logging
-from requests.exceptions import ConnectionError, HTTPError
-logging.getLogger("airflow.hooks.base").setLevel(logging.ERROR)
+import requests
+from airflow.decorators import dag, task
+from airflow.models.param import Param
+from airflow.utils.context import Context
+import pendulum
 
-# ➕ imports mínimos extra para ZIP y correo
-import shutil
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
+# ---------- helpers ----------
+ITUNES_URL = "https://itunes.apple.com/search"
 
-POKEMON_LIMIT = 1000
-OUTPUT_PATH = "/tmp/pokemon_data/pokemon_base.csv"
-POKEMON_DATA_PATH = "/tmp/pokemon_data/pokemon_data.json"
-SPECIES_DATA_PATH = "/tmp/pokemon_data/species_data.json"
-MERGED_DATA_PATH = "/tmp/pokemon_data/pokemon_merged.csv"
+COMMON_COLS = [
+    "item_id", "type", "title", "genre", "release_year",
+    "price_usd", "duration_min", "country", "content_rating",
+    "store_url", "artwork_url", "search_term"
+]
 
-default_args = {
-    'owner': 'Maria',
-    'start_date': datetime.today() - timedelta(days=1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=2),
-    'email_on_failure': False,
-    'depends_on_past': False,
-}
+def _request_json(url: str, params: Dict) -> Dict:
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-# Tarea A: /pokemon/{id}
-def download_pokemon_data(**kwargs):
-    import os
-    import json
-    import time
-    import logging
-    from airflow.providers.http.hooks.http import HttpHook
+def _safe_year(ms: int | None) -> int | None:
+    # iTunes devuelve releaseDate como ISO8601; a veces falta.
+    if ms is None:
+        return None
+    return ms
 
-    ti = kwargs['ti']
-    results = json.loads(ti.xcom_pull(task_ids='fetch_pokemon_list'))['results']
-    os.makedirs(os.path.dirname(POKEMON_DATA_PATH), exist_ok=True)
+def _norm_minutes(ms: int | None) -> float | None:
+    if ms is None or ms <= 0:
+        return None
+    return round(ms / 60000.0, 2)
 
-    if os.path.exists(POKEMON_DATA_PATH):
-        with open(POKEMON_DATA_PATH, 'r') as f:
-            pokemon_data = json.load(f)
-        done_names = {p['name'] for p in pokemon_data}
-        logging.info(f"[INFO] Ya existen {len(done_names)} pokémon descargados.")
-    else:
-        pokemon_data = []
-        done_names = set()
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
-    hook = HttpHook(http_conn_id='pokeapi', method='GET')
-
-    try:
-        for i, entry in enumerate(results):
-            name = entry['name']
-            if name in done_names:
-                continue
-            url = entry['url']
-            pokemon_id = url.strip('/').split('/')[-1]
-            endpoint = f"/pokemon/{pokemon_id}/"
-            res = hook.run(endpoint)
-            pokemon = res.json()
-            pokemon_data.append(pokemon)
-            done_names.add(name)
-            if (i + 1) % 100 == 0:
-                with open(POKEMON_DATA_PATH, 'w') as f:
-                    json.dump(pokemon_data, f)
-                logging.info(f"[INFO] {i + 1} pokémon procesados (hasta ahora {len(pokemon_data)} guardados)")
-            time.sleep(0.5)
-    except Exception as e:
-        logging.error(f"[ERROR] Interrupción en pokémon: {e}")
-        with open(POKEMON_DATA_PATH, 'w') as f:
-            json.dump(pokemon_data, f)
-        raise e
-
-    with open(POKEMON_DATA_PATH, 'w') as f:
-        json.dump(pokemon_data, f)
-    logging.info(f"[INFO] Descarga finalizada con {len(pokemon_data)} pokémon.")
-
-# Tarea B: /pokemon-species/{id}
-def download_species_data(**kwargs):
-    import os
-    import json
-    import time
-    import logging
-    from airflow.providers.http.hooks.http import HttpHook
-
-    ti = kwargs['ti']
-    results = json.loads(ti.xcom_pull(task_ids='fetch_pokemon_list'))['results']
-    os.makedirs(os.path.dirname(SPECIES_DATA_PATH), exist_ok=True)
-
-    if os.path.exists(SPECIES_DATA_PATH):
-        with open(SPECIES_DATA_PATH, 'r') as f:
-            species_data = json.load(f)
-        done_names = {s['name'] for s in species_data}
-        logging.info(f"[INFO] Ya existen {len(done_names)} species descargadas.")
-    else:
-        species_data = []
-        done_names = set()
-
-    hook = HttpHook(http_conn_id='pokeapi', method='GET')
-
-    try:
-        for i, entry in enumerate(results):
-            name = entry['name']
-            if name in done_names:
-                continue
-            url = entry['url']
-            pokemon_id = url.strip('/').split('/')[-1]
-            endpoint = f"/pokemon-species/{pokemon_id}/"
-            res = hook.run(endpoint)
-            species = res.json()
-            species_data.append({
-                'name': species['name'],
-                'generation': species['generation']['name'],
-                'is_legendary': species['is_legendary']
-            })
-            done_names.add(species['name'])
-            if (i + 1) % 100 == 0:
-                with open(SPECIES_DATA_PATH, 'w') as f:
-                    json.dump(species_data, f)
-                logging.info(f"[INFO] {i + 1} species procesadas (hasta ahora {len(species_data)} guardadas)")
-            time.sleep(0.5)
-    except Exception as e:
-        logging.error(f"[ERROR] Interrupción en species: {e}")
-        with open(SPECIES_DATA_PATH, 'w') as f:
-            json.dump(species_data, f)
-        raise e
-
-    with open(SPECIES_DATA_PATH, 'w') as f:
-        json.dump(species_data, f)
-    logging.info(f"[INFO] Descarga finalizada con {len(species_data)} species.")
-
-# Tarea C: combinar y transformar (🔧 agregado: columna grupo y CSV con ds en output/)
-def merge_and_transform_data(**kwargs):
-    with open(POKEMON_DATA_PATH, 'r') as f:
-        pokemon_data = json.load(f)
-    with open(SPECIES_DATA_PATH, 'r') as f:
-        species_data = json.load(f)
-
-    species_lookup = {
-        s['name']: {'generation': s['generation'], 'is_legendary': s['is_legendary']}
-        for s in species_data
-    }
-
-    tidy_records = []
-    for p in pokemon_data:
-        p_info = species_lookup.get(p['name'], {})
-        stats = {s['stat']['name']: s['base_stat'] for s in p.get('stats', [])}
-        types = sorted(p.get('types', []), key=lambda t: t['slot'])
-        tidy_records.append({
-            "id": p.get("id"),
-            "name": p.get("name"),
-            "height": p.get("height"),
-            "weight": p.get("weight"),
-            "base_experience": p.get("base_experience"),
-            "generation": p_info.get("generation"),
-            "is_legendary": p_info.get("is_legendary", False),
-            "type_1": types[0]['type']['name'] if len(types) > 0 else None,
-            "type_2": types[1]['type']['name'] if len(types) > 1 else None,
-            "hp": stats.get("hp"),
-            "attack": stats.get("attack"),
-            "defense": stats.get("defense"),
-            "special-attack": stats.get("special-attack"),
-            "special-defense": stats.get("special-defense"),
-            "speed": stats.get("speed"),
-        })
-    df = pd.DataFrame(tidy_records)
-
-    # ➕ NUEVO: columna de grupo programática
-    df["grupo"] = "Grupo 7"
-
-    # ➕ NUEVO: guardar output/final_{{ ds }}.csv
-    ds = kwargs["ds"]  # fecha de ejecución
-    output_dir = os.path.join(os.getcwd(), "output")
-    os.makedirs(output_dir, exist_ok=True)
-    final_csv = os.path.join(output_dir, f"final_{ds}.csv")
-    df.to_csv(final_csv, index=False)
-    print(f"[INFO] CSV guardado en: {final_csv}")
-
-    # Se mantiene también el CSV histórico existente (sin romper lo anterior)
-    os.makedirs(os.path.dirname(MERGED_DATA_PATH), exist_ok=True)
-    df.to_csv(MERGED_DATA_PATH, index=False)
-
-# ➕ NUEVO: Tarea D - ZIP de logs reales a output/logs_{{ ds }}.zip
-def exportar_logs_reales_zip(**kwargs):
-    ds = kwargs["ds"]
-    dag_id = kwargs["dag"].dag_id
-
-    output_dir = os.path.join(os.getcwd(), "output")
-    os.makedirs(output_dir, exist_ok=True)
-
-    logs_base = f"/usr/local/airflow/logs/dag_id={dag_id}"
-    if not os.path.exists(logs_base):
-        # fallback común en otras instalaciones
-        alt = f"/opt/airflow/logs/{dag_id}"
-        if os.path.exists(alt):
-            logs_base = alt
-        else:
-            logging.warning(f"[WARN] Carpeta de logs no encontrada: {logs_base} / {alt}. Se creará ZIP vacío.")
-            os.makedirs(os.path.join(output_dir, "logs_vacios"), exist_ok=True)
-            logs_base = os.path.join(output_dir, "logs_vacios")
-
-    zip_wo_ext = os.path.join(output_dir, f"logs_{ds}")
-    shutil.make_archive(zip_wo_ext, "zip", logs_base)
-    logging.info(f"[INFO] ZIP de logs creado: {zip_wo_ext}.zip")
-
-# ➕ NUEVO: Tarea E - Enviar correo con CSV y ZIP adjuntos
-def enviar_correo_manual(**kwargs):
-    ds = kwargs["ds"]
-    output_dir = os.path.join(os.getcwd(), "output")
-    csv_path = os.path.join(output_dir, f"final_{ds}.csv")
-    zip_path = os.path.join(output_dir, f"logs_{ds}.zip")
-
-    to_addr = "cienciadedatos.frm.utn@gmail.com"
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASSWORD")
-    if not smtp_user or not smtp_pass:
-        raise RuntimeError("Faltan variables de entorno SMTP_USER / SMTP_PASSWORD.")
-
-    subject = f"Entrega Grupo 7 - {ds}"
-    body = (
-        f"Hola,\n\nAdjuntamos la entrega del Grupo 7 correspondiente a {ds}.\n\n"
-        f"Archivos:\n- final_{ds}.csv\n- logs_{ds}.zip\n\n"
-        f"Saludos."
-    )
-
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    # Adjuntar CSV
-    with open(csv_path, "rb") as f:
-        part_csv = MIMEBase("application", "octet-stream")
-        part_csv.set_payload(f.read())
-    encoders.encode_base64(part_csv)
-    part_csv.add_header("Content-Disposition", f'attachment; filename="final_{ds}.csv"')
-    msg.attach(part_csv)
-
-    # Adjuntar ZIP
-    with open(zip_path, "rb") as f:
-        part_zip = MIMEBase("application", "zip")
-        part_zip.set_payload(f.read())
-    encoders.encode_base64(part_zip)
-    part_zip.add_header("Content-Disposition", f'attachment; filename="logs_{ds}.zip"')
-    msg.attach(part_zip)
-
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, [to_addr], msg.as_string())
-
-    logging.info(f"[INFO] Email enviado a {to_addr} con adjuntos.")
-
-# DAG
-with DAG(
-    dag_id='pokemon_base_etl_parallel',
-    description='DAG ETL paralelo que une data de /pokemon y /pokemon-species',
-    default_args=default_args,
-    schedule=None,
+# ---------- DAG ----------
+@dag(
+    start_date=pendulum.datetime(2025, 9, 1, tz="America/Argentina/Mendoza"),
+    schedule=None,  # ejecución manual; podés programarlo luego
     catchup=False,
-    tags=['pokemon', 'parallel', 'etl']
-) as dag:
+    tags=["recs", "itunes", "ing-datos"],
+    params={
+        # Semillas libres: podés cambiarlas al disparar el DAG.
+        "music_terms": Param(["rock", "pop", "electronica"], type="array"),
+        "movie_terms": Param(["science fiction", "comedy", "drama"], type="array"),
+        "limit_per_term": Param(50, type="integer", minimum=10, maximum=200),
+        "country": Param("US", type="string"),
+    },
+    default_args={"owner": "data-eng"},
+)
+def recs_itunes_dag():
+    """Pipeline: extracción -> transformación -> validación -> dataset final."""
 
-    fetch_pokemon_list = HttpOperator(
-        task_id='fetch_pokemon_list',
-        http_conn_id='pokeapi',
-        endpoint=f'/pokemon?limit={POKEMON_LIMIT}',
-        method='GET',
-        log_response=True,
-        response_filter=lambda response: response.text,
-        do_xcom_push=True,
+    @task
+    def make_run_dir(context: Context) -> str:
+        run_dir = Path(f"/tmp/recs_data/{context['ds_nodash']}")
+        _ensure_dir(run_dir)
+        return str(run_dir)
+
+    @task
+    def extract_itunes(media: str, terms: List[str], limit: int, country: str, run_dir: str) -> str:
+        """
+        media: 'music' o 'movie'
+        Devuelve ruta a JSONL crudo.
+        """
+        out = Path(run_dir) / f"{media}_raw.jsonl"
+        with out.open("w", encoding="utf-8") as f:
+            for term in terms:
+                payload = {
+                    "media": media,
+                    "term": term,
+                    "limit": limit,
+                    "country": country,
+                    # para movies conviene entity=movie; para música usamos song
+                    "entity": "movie" if media == "movie" else "song",
+                }
+                data = _request_json(ITUNES_URL, payload)
+                for row in data.get("results", []):
+                    row["_search_term"] = term  # trazabilidad
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return str(out)
+
+    @task
+    def transform_music(raw_path: str, run_dir: str) -> str:
+        rows = []
+        with open(raw_path, "r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                rows.append({
+                    "item_id": r.get("trackId") or r.get("collectionId"),
+                    "type": "music",
+                    "title": r.get("trackName") or r.get("collectionName"),
+                    "genre": r.get("primaryGenreName"),
+                    "release_year": int(str(r.get("releaseDate", ""))[:4]) if r.get("releaseDate") else None,
+                    "price_usd": r.get("trackPrice") or r.get("collectionPrice"),
+                    "duration_min": _norm_minutes(r.get("trackTimeMillis")),
+                    "country": r.get("country"),
+                    "content_rating": r.get("contentAdvisoryRating"),
+                    "store_url": r.get("trackViewUrl") or r.get("collectionViewUrl"),
+                    "artwork_url": r.get("artworkUrl100"),
+                    "search_term": r.get("_search_term"),
+                })
+        df = pd.DataFrame(rows)
+        out = Path(run_dir) / "music_clean.parquet"
+        df.to_parquet(out, index=False)
+        return str(out)
+
+    @task
+    def transform_movies(raw_path: str, run_dir: str) -> str:
+        rows = []
+        with open(raw_path, "r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                rows.append({
+                    "item_id": r.get("trackId") or r.get("collectionId"),
+                    "type": "movie",
+                    "title": r.get("trackName") or r.get("collectionName"),
+                    "genre": r.get("primaryGenreName"),
+                    "release_year": int(str(r.get("releaseDate", ""))[:4]) if r.get("releaseDate") else None,
+                    "price_usd": r.get("trackHdPrice") or r.get("trackPrice") or r.get("collectionPrice"),
+                    "duration_min": _norm_minutes(r.get("trackTimeMillis")),
+                    "country": r.get("country"),
+                    "content_rating": r.get("contentAdvisoryRating"),
+                    "store_url": r.get("trackViewUrl") or r.get("collectionViewUrl"),
+                    "artwork_url": r.get("artworkUrl100"),
+                    "search_term": r.get("_search_term"),
+                })
+        df = pd.DataFrame(rows)
+        out = Path(run_dir) / "movies_clean.parquet"
+        df.to_parquet(out, index=False)
+        return str(out)
+
+    @task
+    def merge_and_validate(music_parquet: str, movies_parquet: str, run_dir: str) -> dict:
+        m1 = pd.read_parquet(music_parquet) if Path(music_parquet).exists() else pd.DataFrame(columns=COMMON_COLS)
+        m2 = pd.read_parquet(movies_parquet) if Path(movies_parquet).exists() else pd.DataFrame(columns=COMMON_COLS)
+        df = pd.concat([m1, m2], ignore_index=True)
+
+        # Normalizaciones mínimas
+        df["genre"] = df["genre"].astype("string").str.lower()
+        df["title"] = df["title"].astype("string").str.strip()
+        df = df.drop_duplicates(subset=["type", "item_id"]).reset_index(drop=True)
+
+        # Validación simple
+        assert not df.empty, "El dataset final quedó vacío."
+        assert df["title"].notna().all(), "Hay títulos nulos."
+        # guardar
+        csv_path = Path(run_dir) / "recs_dataset.csv"
+        pq_path = Path(run_dir) / "recs_dataset.parquet"
+        db_path = Path(run_dir) / "recs_dataset.sqlite"
+
+        df.to_csv(csv_path, index=False)
+        df.to_parquet(pq_path, index=False)
+
+        # SQLite para practicar SQL y alimentar BI
+        with sqlite3.connect(db_path) as con:
+            df.to_sql("items", con, if_exists="replace", index=False)
+
+        return {"csv": str(csv_path), "parquet": str(pq_path), "sqlite": str(db_path), "rows": len(df)}
+
+    @task
+    def zip_artifacts(artifacts: dict, run_dir: str) -> str:
+        zip_path = Path(run_dir) / "recs_artifacts.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for k, v in artifacts.items():
+                if k in {"rows"}:  # solo archivos
+                    continue
+                z.write(v, arcname=Path(v).name)
+        # también incluimos un README básico
+        readme = Path(run_dir) / "README.txt"
+        readme.write_text(
+            "Recs dataset generado automáticamente.\n"
+            f"Filas: {artifacts['rows']}\n"
+            "Archivos: recs_dataset.csv, recs_dataset.parquet, recs_dataset.sqlite\n",
+            encoding="utf-8",
+        )
+        with zipfile.ZipFile(zip_path, "a", compression=zipfile.ZIP_DEFLATED) as z:
+            z.write(readme, arcname="README.txt")
+        return str(zip_path)
+
+    run_dir = make_run_dir()
+
+    music_raw = extract_itunes.partial(
+        media="music"
+    ).expand(
+        terms=[ [t] for t in "{{ params.music_terms }}".split(",") ]  # truco si quisieras mapear; aquí vamos simple
     )
 
-    download_a = PythonOperator(
-        task_id='download_pokemon_data',
-        python_callable=download_pokemon_data,
+    # versión simple (sin map): usa params directamente
+    music_raw = extract_itunes.override(task_id="extract_music")(
+        media="music",
+        terms="{{ params.music_terms }}",  # Airflow serializa list Param
+        limit="{{ params.limit_per_term }}",
+        country="{{ params.country }}",
+        run_dir=run_dir,
     )
 
-    download_b = PythonOperator(
-        task_id='download_species_data',
-        python_callable=download_species_data,
+    movies_raw = extract_itunes.override(task_id="extract_movies")(
+        media="movie",
+        terms="{{ params.movie_terms }}",
+        limit="{{ params.limit_per_term }}",
+        country="{{ params.country }}",
+        run_dir=run_dir,
     )
 
-    merge_transform = PythonOperator(
-        task_id='merge_and_transform_data',
-        python_callable=merge_and_transform_data,
-    )
+    music_clean = transform_music(music_raw, run_dir)
+    movies_clean = transform_movies(movies_raw, run_dir)
+    artifacts = merge_and_validate(music_clean, movies_clean, run_dir)
+    zip_path = zip_artifacts(artifacts, run_dir)
 
-    # ➕ NUEVAS tareas
-    zip_logs = PythonOperator(
-        task_id='exportar_logs_reales_zip',
-        python_callable=exportar_logs_reales_zip,
-    )
-
-    send_email = PythonOperator(
-        task_id='enviar_correo_manual',
-        python_callable=enviar_correo_manual,
-    )
-
-    # Dependencias: sin tocar lo previo, solo agrego el paso de ZIP y email al final
-    fetch_pokemon_list >> [download_a, download_b] >> merge_transform >> zip_logs >> send_email
+recs_itunes_dag()
