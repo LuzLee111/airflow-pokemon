@@ -211,6 +211,94 @@ def merge_and_transform_data(**kwargs):
     df.to_csv(MERGED_DATA_PATH, index=False)
     print(f"[INFO] CSV guardado en: {MERGED_DATA_PATH}")
 
+def recs_itunes_dag():
+    """Pipeline: extracción -> transformación -> validación -> dataset final."""
+
+    @task
+    def make_run_dir(context: Context) -> str:
+        run_dir = Path(f"/tmp/recs_data/{context['ds_nodash']}")
+        _ensure_dir(run_dir)
+        return str(run_dir)
+
+    @task
+    def extract_itunes(media: str, terms: List[str], limit: int, country: str, run_dir: str) -> str:
+        """
+        media: 'music' o 'movie'
+        Devuelve ruta a JSONL crudo.
+        """
+        out = Path(run_dir) / f"{media}_raw.jsonl"
+        with out.open("w", encoding="utf-8") as f:
+            for term in terms:
+                payload = {
+                    "media": media,
+                    "term": term,
+                    "limit": limit,
+                    "country": country,
+                    # para movies conviene entity=movie; para música usamos song
+                    "entity": "movie" if media == "movie" else "song",
+                }
+                data = _request_json(ITUNES_URL, payload)
+                for row in data.get("results", []):
+                    row["_search_term"] = term  # trazabilidad
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return str(out)
+
+    @task
+    def transform_music(raw_path: str, run_dir: str) -> str:
+        rows = []
+        with open(raw_path, "r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                rows.append({
+                    "item_id": r.get("trackId") or r.get("collectionId"),
+                    "type": "music",
+                    "title": r.get("trackName") or r.get("collectionName"),
+                    "genre": r.get("primaryGenreName"),
+                    "release_year": int(str(r.get("releaseDate", ""))[:4]) if r.get("releaseDate") else None,
+                    "price_usd": r.get("trackPrice") or r.get("collectionPrice"),
+                    "duration_min": _norm_minutes(r.get("trackTimeMillis")),
+                    "country": r.get("country"),
+                    "content_rating": r.get("contentAdvisoryRating"),
+                    "store_url": r.get("trackViewUrl") or r.get("collectionViewUrl"),
+                    "artwork_url": r.get("artworkUrl100"),
+                    "search_term": r.get("_search_term"),
+                })
+        df = pd.DataFrame(rows)
+        out = Path(run_dir) / "music_clean.parquet"
+        df.to_parquet(out, index=False)
+        return str(out)
+
+    @task
+    def transform_movies(raw_path: str, run_dir: str) -> str:
+        rows = []
+        with open(raw_path, "r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                rows.append({
+                    "item_id": r.get("trackId") or r.get("collectionId"),
+                    "type": "movie",
+                    "title": r.get("trackName") or r.get("collectionName"),
+                    "genre": r.get("primaryGenreName"),
+                    "release_year": int(str(r.get("releaseDate", ""))[:4]) if r.get("releaseDate") else None,
+                    "price_usd": r.get("trackHdPrice") or r.get("trackPrice") or r.get("collectionPrice"),
+                    "duration_min": _norm_minutes(r.get("trackTimeMillis")),
+                    "country": r.get("country"),
+                    "content_rating": r.get("contentAdvisoryRating"),
+                    "store_url": r.get("trackViewUrl") or r.get("collectionViewUrl"),
+                    "artwork_url": r.get("artworkUrl100"),
+                    "search_term": r.get("_search_term"),
+                })
+        df = pd.DataFrame(rows)
+        out = Path(run_dir) / "movies_clean.parquet"
+        df.to_parquet(out, index=False)
+        return str(out)
+
+    @task
+    def merge_and_validate(music_parquet: str, movies_parquet: str, run_dir: str) -> dict:
+        m1 = pd.read_parquet(music_parquet) if Path(music_parquet).exists() else pd.DataFrame(columns=COMMON_COLS)
+        m2 = pd.read_parquet(movies_parquet) if Path(movies_parquet).exists() else pd.DataFrame(columns=COMMON_COLS)
+        df = pd.concat([m1, m2], ignore_index=True)
+
 # DAG
 with DAG(
     dag_id='pokemon_base_etl_parallel',
